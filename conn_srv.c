@@ -94,53 +94,43 @@ static ngx_stream_session_t *login_srv_session;
 //static ngx_stream_session_t *login_srv_session;
 static game_client client_session[UINT16_MAX + 1];
 
-static void conn_srv_game_srv_handler(ngx_event_t *ev)
+static int on_event_handle(ngx_event_t *ev)
 {
     ngx_connection_t             *c;
     ngx_stream_session_t         *s;
 
     c = ev->data;
     s = c->data;
-	assert(s = game_srv_session);
-
 
     if (ev->timedout) {
-
         if (ev->delayed) {
-
             ev->timedout = 0;
             ev->delayed = 0;
-
             if (!ev->ready) {
                 if (ngx_handle_read_event(ev, 0) != NGX_OK) {
-                    ngx_stream_close_connection(c);
-                    return;
+                    return -1;
                 }
             }
-
         } else {
             ngx_connection_error(c, NGX_ETIMEDOUT, "connection timed out");
-            ngx_stream_close_connection(c);
-            return;
+            return -10;
         }
 
     } else if (ev->delayed) {
-
         ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                        "stream connection delayed");
-
         if (ngx_handle_read_event(ev, 0) != NGX_OK) {
-            ngx_stream_close_connection(c);
+			return -20;
         }
 
-        return;
+        return 0;
     }
 
-    size_t                        size;//, limit_rate;
+    size_t                        size;
     ssize_t                       n;
-    ngx_buf_t                    *b;
+    ngx_buf_t                     *b;
     ngx_uint_t                    flags;
-    ngx_log_handler_pt            handler;
+//    ngx_log_handler_pt            handler;
 
     for ( ;; ) {
         if (ev->write) {
@@ -149,8 +139,7 @@ static void conn_srv_game_srv_handler(ngx_event_t *ev)
             if (size && c->write->ready) {
                 n = c->send(c, b->pos, size);
                 if (n == NGX_ERROR) {
-                    ngx_stream_close_connection(c);
-                    return;
+                    return -30;
                 }
                 if (n > 0) {
                     b->pos += n;
@@ -184,10 +173,10 @@ static void conn_srv_game_srv_handler(ngx_event_t *ev)
     }
 
     if (c->read->eof) {
-        handler = c->log->handler;
-        c->log->handler = NULL;
+//        handler = c->log->handler;
+//        c->log->handler = NULL;
 
-		ngx_log_error(NGX_LOG_ERR, c->log, 0, "game srv disconnected");
+//		ngx_log_error(NGX_LOG_ERR, c->log, 0, "game srv disconnected");
 		
 
 //        ngx_log_error(NGX_LOG_INFO, c->log, 0,
@@ -197,21 +186,30 @@ static void conn_srv_game_srv_handler(ngx_event_t *ev)
 //                      from_upstream ? "upstream" : "client",
 //                      s->received, c->sent, u->received, pc ? pc->sent : 0);
 
-        c->log->handler = handler;
+			//      c->log->handler = handler;
 
-        ngx_stream_close_connection(c);
-		game_srv_session = NULL;
-        return;
+        return -40;
     }
 
     flags = c->read->eof ? NGX_CLOSE_EVENT : 0;
 
     if (ngx_handle_read_event(c->read, flags) != NGX_OK) {
-        ngx_stream_close_connection(c);
-        return;
+        return -50;
     }
 
-    return;
+    return 0;
+}
+
+static void conn_srv_game_srv_handler(ngx_event_t *ev)
+{
+	assert(game_srv_session);
+	if (on_event_handle(ev) != 0)
+	{
+		ngx_connection_t *c = ev->data;
+		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: game srv disconnected", __FUNCTION__, __LINE__);
+		ngx_stream_close_connection(c);
+		game_srv_session = NULL;
+	}
 }
 
 static int init_server_session(ngx_stream_session_t *s)
