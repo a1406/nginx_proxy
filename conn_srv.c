@@ -211,6 +211,29 @@ static void conn_srv_game_srv_handler(ngx_event_t *ev)
 		game_srv_session = NULL;
 	}
 }
+static void conn_srv_login_srv_handler(ngx_event_t *ev)
+{
+	assert(login_srv_session);
+	if (on_event_handle(ev) != 0)
+	{
+		ngx_connection_t *c = ev->data;
+		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: login srv disconnected", __FUNCTION__, __LINE__);
+		ngx_stream_close_connection(c);
+		login_srv_session = NULL;
+	}
+}
+static void conn_srv_client_handler(ngx_event_t *ev)
+{
+	if (on_event_handle(ev) != 0)
+	{
+		ngx_connection_t *c = ev->data;
+		game_client *client = &client_session[c->fd];
+		assert(client->session == c->data);
+		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client[%d][%lu] disconnected", __FUNCTION__, __LINE__, c->fd, client->player_id);
+		client_session[c->fd].session = NULL;
+		ngx_stream_close_connection(c);
+	}
+}
 
 static int init_server_session(ngx_stream_session_t *s)
 {
@@ -300,8 +323,8 @@ static void on_login_srv_connected(ngx_stream_session_t *s)
 	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: login srv connected", __FUNCTION__, __LINE__);
 	login_srv_session = s;
 	
-	c->write->handler = conn_srv_game_srv_handler;
-    c->read->handler = conn_srv_game_srv_handler;
+	c->write->handler = conn_srv_login_srv_handler;
+    c->read->handler = conn_srv_login_srv_handler;
 }
 
 static void on_client_connected(ngx_stream_session_t *s)
@@ -311,6 +334,8 @@ static void on_client_connected(ngx_stream_session_t *s)
 	assert(c->fd <= UINT16_MAX);
 	assert(client_session[c->fd].session == NULL);
 	client_session[c->fd].session = s;
+	static uint64_t player_id = 100;
+	client_session[c->fd].player_id = player_id++;
 
 	if (init_server_session(s) != 0)
 	{
@@ -318,10 +343,10 @@ static void on_client_connected(ngx_stream_session_t *s)
 		ngx_stream_close_connection(c);		
 		return;
 	}
-	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client connected", __FUNCTION__, __LINE__);
+	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client[%d][%lu] connected", __FUNCTION__, __LINE__, c->fd, client_session[c->fd].player_id);
 	
-	c->write->handler = conn_srv_game_srv_handler;
-    c->read->handler = conn_srv_game_srv_handler;
+	c->write->handler = conn_srv_client_handler;
+    c->read->handler = conn_srv_client_handler;
 }
 
 static char *conn_srv_login_srv(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
