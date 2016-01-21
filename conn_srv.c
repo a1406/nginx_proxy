@@ -157,7 +157,33 @@ static int add_list_buf(ngx_pool_t *pool, conn_buf_list *list, int big)
 	return (0);
 }
 
-__attribute__((unused)) static int del_list_buf(conn_buf_list *list)
+static int change_to_big_buf(ngx_pool_t *pool, conn_buf_list *list)
+{
+	ngx_chain_t *chain = list->last;
+	assert(chain);
+	assert(chain->buf->end - chain->buf->start == DEFAULT_NORMAL_BUF_SIZE);
+
+	ngx_chain_t *big_chain = _del_list_chain(&free_big_buf_list);
+	if (!big_chain)
+		_add_list_chain(pool, &free_big_buf_list, DEFAULT_BIG_BUF_SIZE);
+	big_chain = _del_list_chain(&free_big_buf_list);
+	if (!big_chain) {
+		return (-1);
+	}
+	int size = chain->buf->last - chain->buf->pos;
+	assert(size == sizeof(PROTO_HEAD));
+	memcpy(big_chain->buf->pos, chain->buf->pos, size);
+	big_chain->buf->last = big_chain->buf->pos + size;
+	chain->buf->pos = chain->buf->last = chain->buf->start;
+	
+	ngx_buf_t *tmp_buf = chain->buf;
+	chain->buf = big_chain->buf;
+	big_chain->buf = tmp_buf;
+	_buf_list_pushback(&free_normal_buf_list, big_chain);
+	return (0);
+}
+
+static int del_list_buf(conn_buf_list *list)
 {
 	ngx_chain_t *chain = _del_list_chain(list);
 	if (!chain)
@@ -226,13 +252,13 @@ static int on_event_handle(ngx_event_t *ev)
         return 0;
     }
 
-    size_t                        size;
+    int                        size;
     ssize_t                       n;
     ngx_buf_t                     *b;
     ngx_uint_t                    flags;
 
     for ( ;; ) {
-        if (ev->write) {
+        if (ev->write && conn_node->send.first) {
 			b = conn_node->send.first->buf;
             size = b->last - b->pos;
             if (size && c->write->ready) {
@@ -244,15 +270,23 @@ static int on_event_handle(ngx_event_t *ev)
                     b->pos += n;
 
                     if (b->pos == b->last) {
-                        b->pos = b->start;
-                        b->last = b->start;
+						del_list_buf(&conn_node->send);
                     }
                 }
             }
         }
-		b = conn_node->recv.first->buf;		
-
-        size = b->end - b->last;
+		b = conn_node->recv.last->buf;
+		assert(b->pos == b->start);
+		uint32_t already_read = b->last - b->pos;
+		if (already_read >= sizeof(PROTO_HEAD)) {
+			PROTO_HEAD *head = (PROTO_HEAD *)(b->pos);
+			size = htons(head->len) + sizeof(EXTERN_DATA) - already_read;
+			assert(size > 0);
+		} else {
+			size = sizeof(PROTO_HEAD) - already_read;
+		}
+//        size = b->end - b->last;
+		assert(size > 0);
 
         if (size && c->read->ready && !c->read->delayed) {
             n = c->recv(c, b->last, size);
@@ -261,6 +295,23 @@ static int on_event_handle(ngx_event_t *ev)
             }
             if (n > 0) {
                 b->last += n;
+				already_read = b->last - b->pos;
+				if (already_read >= sizeof(PROTO_HEAD)) {
+					PROTO_HEAD *head = (PROTO_HEAD *)(b->pos);
+					assert(htons(head->len) >= already_read);
+					if (htons(head->len) == already_read) {
+//						add_extern_data(head, c);
+						add_list_buf(c->pool, &conn_node->recv, 0);						
+					} else if (already_read == sizeof(PROTO_HEAD)
+						&& (b->end - b->start) <  (int)(htons(head->len) + sizeof(EXTERN_DATA))) {
+						if (htons(head->len) + sizeof(EXTERN_DATA) > DEFAULT_BIG_BUF_SIZE) {
+							ngx_log_error(NGX_LOG_ERR, c->log, 0, "msg need size[%u] too large", htons(head->len));
+							c->read->eof = 1;
+							break;
+						}
+						change_to_big_buf(c->pool, &conn_node->recv);
+					}
+				}
                 continue;
             }
 
