@@ -158,6 +158,13 @@ static int add_list_buf(conn_buf_list *list, int big)
 	return (0);
 }
 
+static void move_chain(conn_buf_list *from, conn_buf_list *to)
+{
+	ngx_chain_t *chain = _del_list_chain(from);
+	assert(chain);
+	_buf_list_pushback(to, chain);
+}
+
 static int change_to_big_buf(conn_buf_list *list)
 {
 	ngx_chain_t *chain = list->last;
@@ -202,29 +209,76 @@ static int del_list_buf(conn_buf_list *list)
 	return (0);
 }
 
-/* typedef struct { */
-/* 	ngx_stream_session_t *session; */
-/* 	conn_buf_list send; */
-/* 	conn_buf_list recv; */
-/* } conn_node_data; */
-
 typedef struct {
 	uint16_t login_seq;  //登录的seq号，登录包返回的时候比较这个seq，不一致则丢弃
 	uint16_t seq;       //客户端发包的seq号，每次加1
-	uint32_t open_id;
-	uint64_t player_id;
-
+	EXTERN_DATA ext_data;
 	ngx_stream_session_t *session;
 	conn_buf_list send;
 	conn_buf_list recv;
-	
-//	conn_node_data session;
 } conn_node_data;
 
 static conn_node_data *game_srv_session;
 static conn_node_data *login_srv_session;
-//static ngx_stream_session_t *login_srv_session;
 static conn_node_data client_session[UINT16_MAX + 1];
+
+static ngx_hash_keys_arrays_t client_player_id_hash;
+
+static void conn_srv_close_connection(ngx_connection_t *c)
+{
+    conn_node_data *conn_node = c->data;
+	if (!conn_node)
+		goto done;
+	int ret;
+	do {
+		ret = del_list_buf(&conn_node->recv);
+	} while (ret == 0);
+	do {
+		ret = del_list_buf(&conn_node->send);
+	} while (ret == 0);
+done:
+	ngx_stream_close_connection(c);
+}
+
+static void transfer_to_login_srv(conn_node_data *conn_node)
+{
+	move_chain(&conn_node->recv, &login_srv_session->send);
+	ngx_connection_t *c = login_srv_session->session->connection;
+	if (ngx_handle_write_event(c->write, 0) != NGX_OK)
+		conn_srv_close_connection(c);
+}
+__attribute__((unused)) static void transfer_to_game_srv(conn_node_data *conn_node)
+{
+	move_chain(&conn_node->recv, &game_srv_session->send);
+	ngx_connection_t *c = game_srv_session->session->connection;
+	if (ngx_handle_write_event(c->write, 0) != NGX_OK)
+		conn_srv_close_connection(c);
+}
+
+static void transfer_to_client_fd(conn_node_data *conn_node, uint32_t fd)
+{
+	assert(fd <= UINT16_MAX);
+	conn_node_data *client = &client_session[fd];
+	if (client->session)
+		return;
+	move_chain(&conn_node->recv, &client->send);
+	ngx_connection_t *c = client->session->connection;
+	if (ngx_handle_write_event(c->write, 0) != NGX_OK)
+		conn_srv_close_connection(c);
+}
+
+static EXTERN_DATA *get_extern_data(PROTO_HEAD *head)
+{
+	return (EXTERN_DATA *)(&head->data[htons(head->len) - sizeof(PROTO_HEAD) - sizeof(EXTERN_DATA)]);
+}
+static void add_extern_data(PROTO_HEAD *head, EXTERN_DATA *data)
+{
+	EXTERN_DATA *extern_data;
+	int old_len = htons(head->len);
+	extern_data = (EXTERN_DATA *)(&head->data[0] + old_len - sizeof(PROTO_HEAD));
+	memcpy(extern_data, data, sizeof(EXTERN_DATA));
+	head->len = htons(old_len + sizeof(EXTERN_DATA));
+}
 
 static int on_event_handle(ngx_event_t *ev)
 {
@@ -341,26 +395,11 @@ static int on_event_handle(ngx_event_t *ev)
     return 0;
 }
 
-static void conn_srv_close_connection(ngx_connection_t *c)
-{
-    conn_node_data *conn_node = c->data;
-	if (!conn_node)
-		goto done;
-	int ret;
-	do {
-		ret = del_list_buf(&conn_node->recv);
-	} while (ret == 0);
-	do {
-		ret = del_list_buf(&conn_node->send);
-	} while (ret == 0);
-done:
-	ngx_stream_close_connection(c);
-}
-
 static void conn_srv_game_srv_handler(ngx_event_t *ev)
 {
 	assert(game_srv_session);
-	if (on_event_handle(ev) != 0)
+	int ret = on_event_handle(ev);
+	if (ret != 0)
 	{
 		ngx_connection_t *c = ev->data;
 		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: game srv disconnected", __FUNCTION__, __LINE__);
@@ -371,9 +410,24 @@ static void conn_srv_game_srv_handler(ngx_event_t *ev)
 static void conn_srv_login_srv_handler(ngx_event_t *ev)
 {
 	assert(login_srv_session);
-	if (on_event_handle(ev) != 0)
+	int ret = on_event_handle(ev);
+	ngx_connection_t *c = ev->data;
+	conn_node_data *client = login_srv_session;
+	ngx_chain_t *chain;
+	for (chain = client->recv.first; chain;)
 	{
-		ngx_connection_t *c = ev->data;
+		size_t len = chain->buf->last - chain->buf->pos;
+		if (len < sizeof(PROTO_HEAD))
+			break;
+		PROTO_HEAD *head = (PROTO_HEAD *)chain->buf->pos;
+		if (htons(head->len) != len)
+			break;
+		EXTERN_DATA *ext = get_extern_data(head);
+		transfer_to_client_fd(client, ext->fd);
+	}
+	
+	if (ret != 0)
+	{
 		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: login srv disconnected", __FUNCTION__, __LINE__);
 		conn_srv_close_connection(c);
 		login_srv_session = NULL;
@@ -381,12 +435,26 @@ static void conn_srv_login_srv_handler(ngx_event_t *ev)
 }
 static void conn_srv_client_handler(ngx_event_t *ev)
 {
-	if (on_event_handle(ev) != 0)
+	int ret = on_event_handle(ev);
+	ngx_connection_t *c = ev->data;
+	conn_node_data *client = &client_session[c->fd];
+	ngx_chain_t *chain;
+	for (chain = client->recv.first; chain;)
 	{
-		ngx_connection_t *c = ev->data;
-		conn_node_data *client = &client_session[c->fd];
+		size_t len = chain->buf->last - chain->buf->pos;
+		if (len < sizeof(PROTO_HEAD))
+			break;
+		PROTO_HEAD *head = (PROTO_HEAD *)chain->buf->pos;
+		if (htons(head->len) != len)
+			break;
+		add_extern_data(head, &client->ext_data);
+		transfer_to_login_srv(client);
+	}
+	
+	if (ret != 0)
+	{
 		assert(client == c->data);
-		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client[%d][%lu] disconnected", __FUNCTION__, __LINE__, c->fd, client->player_id);
+		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client[%d][%lu] disconnected", __FUNCTION__, __LINE__, c->fd, client->ext_data.player_id);
 		client->session = NULL;
 		conn_srv_close_connection(c);
 	}
@@ -434,6 +502,7 @@ static void on_game_srv_connected(ngx_stream_session_t *s)
 		conn_srv_close_connection(c);
 		return;
 	}
+	game_srv_session->ext_data.fd = c->fd;
 	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: game srv connected", __FUNCTION__, __LINE__);
 	
 	c->write->handler = conn_srv_game_srv_handler;
@@ -464,6 +533,7 @@ static void on_login_srv_connected(ngx_stream_session_t *s)
 		conn_srv_close_connection(c);
 		return;
 	}
+	login_srv_session->ext_data.fd = c->fd;	
 	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: login srv connected", __FUNCTION__, __LINE__);
 	
 	c->write->handler = conn_srv_login_srv_handler;
@@ -482,10 +552,8 @@ static void on_client_connected(ngx_stream_session_t *s)
 		conn_srv_close_connection(c);		
 		return;
 	}
-	static uint64_t player_id = 100;
-	client_session[c->fd].player_id = player_id++;
-	
-	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client[%d][%lu] connected", __FUNCTION__, __LINE__, c->fd, client_session[c->fd].player_id);
+	client_session[c->fd].ext_data.fd = c->fd;		
+	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client[%d] connected", __FUNCTION__, __LINE__, c->fd);
 	
 	c->write->handler = conn_srv_client_handler;
     c->read->handler = conn_srv_client_handler;
@@ -517,5 +585,12 @@ static char *conn_srv_game_srv(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 ngx_int_t conn_srv_init_module(ngx_cycle_t *cycle)
 {
 	conn_buf_pool = ngx_create_pool(1024, cycle->log);
+	memset(&client_player_id_hash, 0, sizeof(client_player_id_hash));
+	client_player_id_hash.pool = conn_buf_pool;
+	client_player_id_hash.temp_pool = conn_buf_pool;	
+	ngx_hash_keys_array_init(&client_player_id_hash, NGX_HASH_LARGE);
+
+	
+	
 	return NGX_OK;
 }
