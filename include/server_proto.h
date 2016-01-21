@@ -642,31 +642,6 @@ typedef struct _activity_info
 	uint32_t begTime;	/// 开始时间
 	uint32_t endTime;	/// 结束时间
 	double rate;		/// 倍率
-	_activity_info() {
-//		id = 0;
-		type = 0;
-		begTime = 0;
-		endTime = 0;
-		rate = 0;
-	}
-
-	_activity_info(const _activity_info& other) {
-//		id = other.id;
-		type = other.type;
-		begTime = other.begTime;
-		endTime = other.endTime;
-		rate = other.rate;
-	}
-
-	_activity_info& operator = (const _activity_info& other) {
-//		id = other.id;
-		type = other.type;
-		begTime = other.begTime;
-		endTime = other.endTime;
-		rate = other.rate;
-
-		return *this;
-	}
 }ACTIVITY_INFO;
 
 typedef struct _activity_info_answer
