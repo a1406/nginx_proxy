@@ -1,9 +1,12 @@
-#include <ngx_config.h>
-#include <ngx_core.h>
-#include <ngx_stream.h>
+#include "ngx_config.h"
+#include "ngx_core.h"
+#include "ngx_stream.h"
+#include "ngx_buf.h"
+#include "ngx_array.h"
+#include "ngx_hash.h"
+#include "ngx_list.h"
 #include <stdint.h>
 #include <assert.h>
-#include "ngx_array.h"
 
 //static void *conn_srv_create_srv_conf(ngx_conf_t *cf);
 static char *conn_srv_game_srv(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -80,27 +83,123 @@ static void *conn_srv_create_srv_conf(ngx_conf_t *cf)
 
     return conf;
 }
-*/    
+*/
+#define DEFAULT_NORMAL_BUF_SIZE (512)
+#define DEFAULT_BIG_BUF_SIZE (51200)
+
+typedef struct {
+	ngx_chain_t *first;	
+	ngx_chain_t *last;	
+} conn_buf_list;
+static conn_buf_list free_normal_buf_list;
+static conn_buf_list free_big_buf_list;
+
+static void _buf_list_pushback(conn_buf_list *list, ngx_chain_t *buf)
+{
+	buf->next = NULL;
+	if (list->last)
+	{
+		assert(list->last->next == NULL);
+		list->last->next = buf;
+	}
+	else
+	{
+		assert(list->first == NULL);
+		list->first = buf;
+	}
+	list->last = buf;
+}
+
+static int _add_list_chain(ngx_pool_t *pool, conn_buf_list *list, uint32_t size)
+{
+	ngx_buf_t *buf = ngx_create_temp_buf(pool, size);
+	if (!buf)
+		return (-1);
+	ngx_chain_t *chain = ngx_alloc_chain_link(pool);
+	if (!chain)
+		return (-10);
+	chain->buf = buf;
+	_buf_list_pushback(list, chain);
+	return (0);
+}
+static ngx_chain_t *_del_list_chain(conn_buf_list *list)
+{
+	ngx_chain_t *buf = list->first;
+	if (!buf)
+		return NULL;
+	list->first = buf->next;
+	if (list->last == buf)
+	{
+		assert(buf->next == NULL);
+		list->last = buf->next;
+	}
+	return buf;
+}
+
+static int add_list_buf(ngx_pool_t *pool, conn_buf_list *list, int big)
+{
+	ngx_chain_t *chain;
+	if (big)
+	{
+		chain = _del_list_chain(&free_big_buf_list);
+		if (!chain)
+			return _add_list_chain(pool, list, DEFAULT_BIG_BUF_SIZE);		
+	}
+	else
+	{
+		chain = _del_list_chain(&free_normal_buf_list);
+		if (!chain)
+			return _add_list_chain(pool, list, DEFAULT_NORMAL_BUF_SIZE);
+		
+	}
+	_buf_list_pushback(list, chain);
+	return (0);
+}
+
+__attribute__((unused)) static int del_list_buf(conn_buf_list *list)
+{
+	ngx_chain_t *chain = _del_list_chain(list);
+	if (!chain)
+		return (-1);
+	chain->buf->last = chain->buf->pos = chain->buf->start;
+	if (chain->buf->end - chain->buf->start == DEFAULT_NORMAL_BUF_SIZE)
+	{
+		_buf_list_pushback(&free_normal_buf_list, chain);
+	}
+	else
+	{
+		assert(chain->buf->end - chain->buf->start == DEFAULT_BIG_BUF_SIZE);
+		_buf_list_pushback(&free_big_buf_list, chain);		
+	}
+	return (0);
+}
+
+typedef struct {
+	ngx_stream_session_t *session;
+	conn_buf_list send;
+	conn_buf_list recv;
+} conn_node_data;
+
 typedef struct {
 	uint16_t login_seq;  //登录的seq号，登录包返回的时候比较这个seq，不一致则丢弃
 	uint16_t seq;       //客户端发包的seq号，每次加1
 	uint32_t open_id;
 	uint64_t player_id;
-	ngx_stream_session_t *session;
+	conn_node_data session;
 } game_client;
 
-static ngx_stream_session_t *game_srv_session;
-static ngx_stream_session_t *login_srv_session;
+static conn_node_data *game_srv_session;
+static conn_node_data *login_srv_session;
 //static ngx_stream_session_t *login_srv_session;
 static game_client client_session[UINT16_MAX + 1];
 
 static int on_event_handle(ngx_event_t *ev)
 {
     ngx_connection_t             *c;
-    ngx_stream_session_t         *s;
+    conn_node_data *conn_node;
 
     c = ev->data;
-    s = c->data;
+    conn_node = c->data;
 
     if (ev->timedout) {
         if (ev->delayed) {
@@ -130,11 +229,10 @@ static int on_event_handle(ngx_event_t *ev)
     ssize_t                       n;
     ngx_buf_t                     *b;
     ngx_uint_t                    flags;
-//    ngx_log_handler_pt            handler;
 
     for ( ;; ) {
         if (ev->write) {
-			b = &s->upstream->upstream_buf;
+			b = conn_node->send.first->buf;
             size = b->last - b->pos;
             if (size && c->write->ready) {
                 n = c->send(c, b->pos, size);
@@ -151,7 +249,7 @@ static int on_event_handle(ngx_event_t *ev)
                 }
             }
         }
-		b = &s->upstream->downstream_buf;
+		b = conn_node->recv.first->buf;		
 
         size = b->end - b->last;
 
@@ -228,56 +326,28 @@ static void conn_srv_client_handler(ngx_event_t *ev)
 	{
 		ngx_connection_t *c = ev->data;
 		game_client *client = &client_session[c->fd];
-		assert(client->session == c->data);
+		assert(&client->session == c->data);
 		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client[%d][%lu] disconnected", __FUNCTION__, __LINE__, c->fd, client->player_id);
-		client_session[c->fd].session = NULL;
+		client->session.session = NULL;
 		ngx_stream_close_connection(c);
 	}
 }
 
-static int init_server_session(ngx_stream_session_t *s)
+static int init_conn_node_data(conn_node_data *data, ngx_stream_session_t *s)
 {
     ngx_connection_t                *c;
-    ngx_stream_upstream_t           *u;	
 	c = s->connection;
+	c->data = data;
 
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
 		ngx_log_error(NGX_LOG_ERR, c->log, 0, "%s %d: fail", __FUNCTION__, __LINE__);		
 		return -1;
     }
-	
-    u = ngx_pcalloc(c->pool, sizeof(ngx_stream_upstream_t));
-    if (u == NULL) {
-		ngx_log_error(NGX_LOG_ERR, c->log, 0, "%s %d: fail", __FUNCTION__, __LINE__);		
-        return -10;
-    }
 
-    s->upstream = u;
-    u->peer.log = c->log;
-    u->peer.log_error = NGX_ERROR_ERR;
-    u->peer.start_time = ngx_current_msec;
-    u->start_sec = ngx_time();
-
-    u_char *p1, *p2;	
-    p1 = ngx_pnalloc(c->pool, 1024);
-    if (p1 == NULL) {
-		ngx_log_error(NGX_LOG_ERR, c->log, 0, "%s %d: fail", __FUNCTION__, __LINE__);		
-        return -20;
-    }
-    u->downstream_buf.start = p1;
-    u->downstream_buf.end = p1 + 1024;
-    u->downstream_buf.pos = p1;
-    u->downstream_buf.last = p1;
-
-    p2 = ngx_pnalloc(c->pool, 1024);
-    if (p2 == NULL) {
-		ngx_log_error(NGX_LOG_ERR, c->log, 0, "%s %d: fail", __FUNCTION__, __LINE__);		
-        return -30;
-    }
-    u->upstream_buf.start = p2;
-    u->upstream_buf.end = p2 + 1024;
-    u->upstream_buf.pos = p2;
-    u->upstream_buf.last = p2;
+	memset(data, 0, sizeof(*data));
+	add_list_buf(c->pool, &data->send, 0);
+	add_list_buf(c->pool, &data->recv, 0);
+	data->session = s;
 	return (0);
 }
 
@@ -291,14 +361,21 @@ static void on_game_srv_connected(ngx_stream_session_t *s)
 		ngx_stream_close_connection(c);
 		return;
 	}
-	if (init_server_session(s) != 0)
+	game_srv_session = ngx_palloc(c->pool, sizeof(*game_srv_session));
+	if (!game_srv_session)
+	{
+		ngx_log_error(NGX_LOG_ERR, c->log, 0, "game srv alloc failed");
+		ngx_stream_close_connection(c);
+		return;
+	}
+	
+	if (init_conn_node_data(game_srv_session, s) != 0)
 	{
 		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: game srv failed", __FUNCTION__, __LINE__);
 		ngx_stream_close_connection(c);
 		return;
 	}
 	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: game srv connected", __FUNCTION__, __LINE__);
-	game_srv_session = s;
 	
 	c->write->handler = conn_srv_game_srv_handler;
     c->read->handler = conn_srv_game_srv_handler;
@@ -314,14 +391,21 @@ static void on_login_srv_connected(ngx_stream_session_t *s)
 		ngx_stream_close_connection(c);
 		return;
 	}
-	if (init_server_session(s) != 0)
+	login_srv_session = ngx_palloc(c->pool, sizeof(*login_srv_session));
+	if (!login_srv_session)
+	{
+		ngx_log_error(NGX_LOG_ERR, c->log, 0, "login srv alloc failed");
+		ngx_stream_close_connection(c);
+		return;
+	}
+	
+	if (init_conn_node_data(login_srv_session, s) != 0)
 	{
 		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: login srv failed", __FUNCTION__, __LINE__);
-		ngx_stream_close_connection(c);		
+		ngx_stream_close_connection(c);
 		return;
 	}
 	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: login srv connected", __FUNCTION__, __LINE__);
-	login_srv_session = s;
 	
 	c->write->handler = conn_srv_login_srv_handler;
     c->read->handler = conn_srv_login_srv_handler;
@@ -332,17 +416,16 @@ static void on_client_connected(ngx_stream_session_t *s)
     ngx_connection_t                *c;
 	c = s->connection;
 	assert(c->fd <= UINT16_MAX);
-	assert(client_session[c->fd].session == NULL);
-	client_session[c->fd].session = s;
-	static uint64_t player_id = 100;
-	client_session[c->fd].player_id = player_id++;
-
-	if (init_server_session(s) != 0)
+	assert(client_session[c->fd].session.session == NULL);
+	if (init_conn_node_data(&client_session[c->fd].session, s) != 0)
 	{
 		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client srv failed", __FUNCTION__, __LINE__);
 		ngx_stream_close_connection(c);		
 		return;
 	}
+	static uint64_t player_id = 100;
+	client_session[c->fd].player_id = player_id++;
+	
 	ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client[%d][%lu] connected", __FUNCTION__, __LINE__, c->fd, client_session[c->fd].player_id);
 	
 	c->write->handler = conn_srv_client_handler;
