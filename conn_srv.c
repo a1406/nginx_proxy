@@ -7,6 +7,7 @@
 #include "ngx_list.h"
 #include <stdint.h>
 #include <assert.h>
+#include "server_proto.h"
 
 //static void *conn_srv_create_srv_conf(ngx_conf_t *cf);
 static char *conn_srv_game_srv(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
