@@ -202,24 +202,29 @@ static int del_list_buf(conn_buf_list *list)
 	return (0);
 }
 
-typedef struct {
-	ngx_stream_session_t *session;
-	conn_buf_list send;
-	conn_buf_list recv;
-} conn_node_data;
+/* typedef struct { */
+/* 	ngx_stream_session_t *session; */
+/* 	conn_buf_list send; */
+/* 	conn_buf_list recv; */
+/* } conn_node_data; */
 
 typedef struct {
 	uint16_t login_seq;  //登录的seq号，登录包返回的时候比较这个seq，不一致则丢弃
 	uint16_t seq;       //客户端发包的seq号，每次加1
 	uint32_t open_id;
 	uint64_t player_id;
-	conn_node_data session;
-} game_client;
+
+	ngx_stream_session_t *session;
+	conn_buf_list send;
+	conn_buf_list recv;
+	
+//	conn_node_data session;
+} conn_node_data;
 
 static conn_node_data *game_srv_session;
 static conn_node_data *login_srv_session;
 //static ngx_stream_session_t *login_srv_session;
-static game_client client_session[UINT16_MAX + 1];
+static conn_node_data client_session[UINT16_MAX + 1];
 
 static int on_event_handle(ngx_event_t *ev)
 {
@@ -324,21 +329,6 @@ static int on_event_handle(ngx_event_t *ev)
     }
 
     if (c->read->eof) {
-//        handler = c->log->handler;
-//        c->log->handler = NULL;
-
-//		ngx_log_error(NGX_LOG_ERR, c->log, 0, "game srv disconnected");
-		
-
-//        ngx_log_error(NGX_LOG_INFO, c->log, 0,
-//                      "%s disconnected"
-//                      ", bytes from/to client:%O/%O"
-//                      ", bytes from/to upstream:%O/%O",
-//                      from_upstream ? "upstream" : "client",
-//                      s->received, c->sent, u->received, pc ? pc->sent : 0);
-
-			//      c->log->handler = handler;
-
         return -40;
     }
 
@@ -394,10 +384,10 @@ static void conn_srv_client_handler(ngx_event_t *ev)
 	if (on_event_handle(ev) != 0)
 	{
 		ngx_connection_t *c = ev->data;
-		game_client *client = &client_session[c->fd];
-		assert(&client->session == c->data);
+		conn_node_data *client = &client_session[c->fd];
+		assert(client == c->data);
 		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client[%d][%lu] disconnected", __FUNCTION__, __LINE__, c->fd, client->player_id);
-		client->session.session = NULL;
+		client->session = NULL;
 		conn_srv_close_connection(c);
 	}
 }
@@ -485,8 +475,8 @@ static void on_client_connected(ngx_stream_session_t *s)
     ngx_connection_t                *c;
 	c = s->connection;
 	assert(c->fd <= UINT16_MAX);
-	assert(client_session[c->fd].session.session == NULL);
-	if (init_conn_node_data(&client_session[c->fd].session, s) != 0)
+	assert(client_session[c->fd].session == NULL);
+	if (init_conn_node_data(&client_session[c->fd], s) != 0)
 	{
 		ngx_log_error(NGX_LOG_INFO, c->log, 0, "%s %d: client srv failed", __FUNCTION__, __LINE__);
 		conn_srv_close_connection(c);		
@@ -521,35 +511,6 @@ static char *conn_srv_game_srv(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_stream_core_srv_conf_t  *cscf;
     cscf = ngx_stream_conf_get_module_srv_conf(cf, ngx_stream_core_module);
     cscf->handler = on_game_srv_connected;
-/*	
-    ngx_stream_proxy_srv_conf_t *pscf = conf;
-
-    ngx_url_t                    u;
-    ngx_str_t                   *value, *url;
-    ngx_stream_core_srv_conf_t  *cscf;
-
-    if (pscf->upstream) {
-        return "is duplicate";
-    }
-
-    cscf = ngx_stream_conf_get_module_srv_conf(cf, ngx_stream_core_module);
-
-    cscf->handler = ngx_stream_proxy_handler;
-
-    value = cf->args->elts;
-
-    url = &value[1];
-
-    ngx_memzero(&u, sizeof(ngx_url_t));
-
-    u.url = *url;
-    u.no_resolve = 1;
-
-    pscf->upstream = ngx_stream_upstream_add(cf, &u, 0);
-    if (pscf->upstream == NULL) {
-        return NGX_CONF_ERROR;
-    }
-*/
     return NGX_CONF_OK;
 }
 
