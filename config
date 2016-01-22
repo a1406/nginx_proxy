@@ -1,5 +1,6 @@
 ngx_addon_name=conn_srv_module   #这里指定模块名称
 STREAM_MODULES="$STREAM_MODULES conn_srv_module"  #指定编译后文件名称
-NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/conn_srv.c"   #指定源文件，这里我只有一个文件多个文件就要全部写上去
+#指定源文件，这里我只有一个文件多个文件就要全部写上去
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/conn_srv.c $ngx_addon_dir/conn_srv_hash.c"
 
 CORE_LIBS="$CORE_LIB"   #这里指定编译的nginx库，这变量是由编译nginx的时候Makefile传递过来的，上面的几个变量也是一样
