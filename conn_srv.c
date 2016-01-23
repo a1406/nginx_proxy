@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <assert.h>
 #include "include/server_proto.h"
+#include "conn_srv_hash.h"
 
 ngx_int_t conn_srv_init_module(ngx_cycle_t *cycle);
 static char *conn_srv_game_srv(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -221,8 +222,7 @@ typedef struct {
 static conn_node_data *game_srv_session;
 static conn_node_data *login_srv_session;
 static conn_node_data client_session[UINT16_MAX + 1];
-
-static ngx_hash_keys_arrays_t client_player_id_hash;
+static dictht *client_player_id_hash;
 
 static void conn_srv_close_connection(ngx_connection_t *c)
 {
@@ -266,6 +266,28 @@ static void transfer_to_client_fd(conn_node_data *conn_node, uint32_t fd)
 	if (ngx_handle_write_event(c->write, 0) != NGX_OK)
 		conn_srv_close_connection(c);
 }
+
+static conn_node_data *get_client_by_playerid(uint64_t player_id)
+{
+	dictVal key;
+	key.u64 = player_id;
+	dictEntry *val = dictFind(client_player_id_hash, key);
+	if (!val)
+		return NULL;
+	return val->val.val;
+}
+
+__attribute__((unused)) static void transfer_to_player(conn_node_data *conn_node, uint64_t player_id)
+{
+	conn_node_data *client = get_client_by_playerid(player_id);
+	if (!client || client->session)
+		return;
+	move_chain(&conn_node->recv, &client->send);
+	ngx_connection_t *c = client->session->connection;
+	if (ngx_handle_write_event(c->write, 0) != NGX_OK)
+		conn_srv_close_connection(c);
+}
+
 
 static EXTERN_DATA *get_extern_data(PROTO_HEAD *head)
 {
@@ -582,15 +604,19 @@ static char *conn_srv_game_srv(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
+static dictType u64hash_type =
+{
+	dictIntHashFunction,
+	NULL,
+	NULL,
+	NULL,
+	NULL,
+    NULL
+};
+
 ngx_int_t conn_srv_init_module(ngx_cycle_t *cycle)
 {
 	conn_buf_pool = ngx_create_pool(1024, cycle->log);
-	memset(&client_player_id_hash, 0, sizeof(client_player_id_hash));
-	client_player_id_hash.pool = conn_buf_pool;
-	client_player_id_hash.temp_pool = conn_buf_pool;	
-	ngx_hash_keys_array_init(&client_player_id_hash, NGX_HASH_LARGE);
-
-	
-	
+	client_player_id_hash = dictCreate(&u64hash_type);
 	return NGX_OK;
 }
